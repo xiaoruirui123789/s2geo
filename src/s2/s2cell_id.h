@@ -1,731 +1,984 @@
-// Copyright 2005 Google Inc. All Rights Reserved.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS-IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-//
-
-// Author: ericv@google.com (Eric Veach)
-
 #ifndef S2_S2CELL_ID_H_
 #define S2_S2CELL_ID_H_
 
-#include <cstddef>
-#include <cstdint>
-#include <functional>
-#include <iostream>
-#include <ostream>
-#include <string>
-#include <type_traits>
-#include <utility>
-#include <vector>
-
-#include "absl/base/attributes.h"
-#include "absl/base/optimization.h"
-#include "absl/hash/hash.h"
-#include "absl/log/absl_check.h"
-#include "absl/numeric/bits.h"
-#include "absl/strings/string_view.h"
-
-#include "s2/_fp_contract_off.h"  // IWYU pragma: keep
-#include "s2/r2.h"
-#include "s2/r2rect.h"
-#include "s2/s1angle.h"
-#include "s2/s2coder.h"
-#include "s2/s2coords.h"
-#include "s2/s2error.h"
+#include "s2/s2cell_id_v1.h"
+#include "s2/s2latlng.h"
 #include "s2/s2point.h"
-#include "s2/s2region.h"
-#include "s2/util/bits/bits.h"
-#include "s2/util/coding/coder.h"
+#include "s2/r2.h"       // 为R2Point
+#include "s2/r2rect.h"   // 为R2Rect
+#include "s2/s1angle.h"  // 为S1Angle
+#include "s2/s2error.h"  // 为S2Error
+#include "s2/s2coder.h"  // 为s2coding命名空间
+#include "s2/util/coding/coder.h" // 为Encoder/Decoder
+#include "absl/strings/string_view.h"  // 为absl::string_view
+#include "absl/hash/hash.h"            // 为absl::Hash
+#include "absl/numeric/bits.h"         // 为absl::rotr
+#include <cstdint>
+#include <string>
+#include <iostream>
+#include <vector>
+#include <exception>
+#include <algorithm>     // 为std::min/max
 
-class S2LatLng;
+// 前向声明，避免命名冲突
+using OriginalS2CellId = s2v1::S2CellId;
 
-// SWIG does not understand attribute syntax.
-#ifndef SWIG
-#define IFNDEF_SWIG(x) x
-#else
-#define IFNDEF_SWIG(x)
-#endif
+// Import standard types
+using std::uint64_t;
 
-// An S2CellId is a 64-bit unsigned integer that uniquely identifies a
-// cell in the S2 cell decomposition.  It has the following format:
-//
-//   id = [face][face_pos]
-//
-//   face:     a 3-bit number (range 0..5) encoding the cube face.
-//
-//   face_pos: a 61-bit number encoding the position of the center of this
-//             cell along the Hilbert curve over this face (see the Wiki
-//             pages for details).
-//
-// Sequentially increasing cell ids follow a continuous space-filling curve
-// over the entire sphere.  They have the following properties:
-//
-//  - The id of a cell at level k consists of a 3-bit face number followed
-//    by k bit pairs that recursively select one of the four children of
-//    each cell.  The next bit is always 1, and all other bits are 0.
-//    Therefore, the level of a cell is determined by the position of its
-//    lowest-numbered bit that is turned on (for a cell at level k, this
-//    position is 2 * (kMaxLevel - k).)
-//
-//  - The id of a parent cell is at the midpoint of the range of ids spanned
-//    by its children (or by its descendants at any level).
-//
-// Leaf cells are often used to represent points on the unit sphere, and
-// this class provides methods for converting directly between these two
-// representations.  For cells that represent 2D regions rather than
-// discrete point, it is better to use the S2Cell class.
-//
-// All methods require `is_valid()` to be true unless otherwise specified
-// (although not all methods enforce this).
-//
-// This class is intended to be copied by value as desired.  It uses
-// the default copy constructor and assignment operator.
+// S2CellId的新编码格式实现
+// 编码格式: 3位face + k个子节点编码(每个2位) + 若干0 + 最后5位表示层数
+// 最大支持28层
 class S2CellId {
- public:
-  // Although only 60 bits are needed to represent the index of a leaf cell, the
-  // extra position bit lets us encode each cell as its Hilbert curve position
-  // at the cell center, which is halfway along the portion of the Hilbert curve
-  // that fills that cell.
-  static constexpr int kFaceBits = 3;
-  static constexpr int kNumFaces = 6;
-  static constexpr int kMaxLevel =
-      S2::kMaxCellLevel;  // Valid levels: 0..kMaxLevel
-  static constexpr int kPosBits = 2 * kMaxLevel + 1;
-  static constexpr int kMaxSize = 1 << kMaxLevel;
-
-  explicit constexpr S2CellId(uint64_t id) : id_(id) {}
-
-  // Construct a leaf cell containing the given point "p".  Usually there is
-  // exactly one such cell, but for points along the edge of a cell, any
-  // adjacent cell may be (deterministically) chosen.  This is because
-  // S2CellIds are considered to be closed sets.  The returned cell will
-  // always contain the given point, i.e.
-  //
-  //   S2Cell(S2CellId(p)).Contains(p)
-  //
-  // is always true.  The point "p" does not need to be normalized.
-  //
-  // If instead you want every point to be contained by exactly one S2Cell,
-  // you will need to convert the S2CellIds to S2Loops (which implement point
-  // containment this way).
-  explicit S2CellId(const S2Point& p);
-
-  // Construct a leaf cell containing the given normalized S2LatLng.
-  // REQUIRES: Latitude and longitude are finite.
-  explicit S2CellId(const S2LatLng& ll);
-
-  // The default constructor returns an invalid cell id.
-  constexpr S2CellId() = default;
-  // Returns an invalid cell id.
-  static constexpr S2CellId None() { return S2CellId(); }
-
-  // Returns an invalid cell id guaranteed to be larger than any
-  // valid cell id.  Useful for creating indexes.
-  static constexpr S2CellId Sentinel() { return S2CellId(~uint64_t{0}); }
-
-  // Return the cell corresponding to a given S2 cube face.
-  static S2CellId FromFace(int face);
-
-  // Return a cell given its face (range 0..5), Hilbert curve position within
-  // that face (an unsigned integer with S2CellId::kPosBits bits), and level
-  // (range 0..kMaxLevel).  The given position will be modified to correspond
-  // to the Hilbert curve position at the center of the returned cell.  This
-  // is a static function rather than a constructor in order to indicate what
-  // the arguments represent.
-  static S2CellId FromFacePosLevel(int face, uint64_t pos, int level);
-
-  // Return the direction vector corresponding to the center of the given
-  // cell.  The vector returned by ToPointRaw is not necessarily unit length.
-  // This method returns the same result as S2Cell::GetCenter().
-  //
-  // The maximum directional error in ToPoint() (compared to the exact
-  // mathematical result) is 1.5 * DBL_EPSILON radians, and the maximum length
-  // error is 2 * DBL_EPSILON (the same as Normalize).
-  S2Point ToPoint() const { return ToPointRaw().Normalize(); }
-  S2Point ToPointRaw() const;
-
-  // Return the center of the cell in (s,t) coordinates (see s2coords.h).
-  R2Point GetCenterST() const;
-
-  // Return the edge length of this cell in (s,t)-space.
-  double GetSizeST() const;
-
-  // Return the edge length in (s,t)-space of cells at the given level.
-  static double GetSizeST(int level);
-
-  // Return the bounds of this cell in (s,t)-space.
-  R2Rect GetBoundST() const;
-
-  // Return the center of the cell in (u,v) coordinates (see s2coords.h).
-  // Note that the center of the cell is defined as the point at which it is
-  // recursively subdivided into four children; in general, it is not at the
-  // midpoint of the (u,v) rectangle covered by the cell.
-  R2Point GetCenterUV() const;
-
-  // Return the bounds of this cell in (u,v)-space.
-  R2Rect GetBoundUV() const;
-
-  // Expand a rectangle in (u,v)-space so that it contains all points within
-  // the given distance of the boundary, and return the smallest such
-  // rectangle.  If the distance is negative, then instead shrink this
-  // rectangle so that it excludes all points within the given absolute
-  // distance of the boundary.
-  //
-  // Distances are measured *on the sphere*, not in (u,v)-space.  For example,
-  // you can use this method to expand the (u,v)-bound of an S2CellId so that
-  // it contains all points within 5km of the original cell.  You can then
-  // test whether a point lies within the expanded bounds like this:
-  //
-  //   R2Point uv;
-  //   if (S2::FaceXYZtoUV(face, point, &uv) && bound.Contains(uv)) { ... }
-  //
-  // Limitations:
-  //
-  //  - Because the rectangle is drawn on one of the six cube-face planes
-  //    (i.e., {x,y,z} = +/-1), it can cover at most one hemisphere.  This
-  //    limits the maximum amount that a rectangle can be expanded.  For
-  //    example, S2CellId bounds can be expanded safely by at most 45 degrees
-  //    (about 5000 km on the Earth's surface).
-  //
-  //  - The implementation is not exact for negative distances.  The resulting
-  //    rectangle will exclude all points within the given distance of the
-  //    boundary but may be slightly smaller than necessary.
-  static R2Rect ExpandedByDistanceUV(const R2Rect& uv, S1Angle distance);
-
-  // Return the (face, si, ti) coordinates of the center of the cell.  Note
-  // that although (si,ti) coordinates span the range [0,2**31] in general,
-  // the cell center coordinates are always in the range [1,2**31-1] and
-  // therefore can be represented using a signed 32-bit integer.
-  int GetCenterSiTi(int* psi, int* pti) const;
-
-  // Return the S2LatLng corresponding to the center of the given cell.
-  S2LatLng ToLatLng() const;
-
-  // The 64-bit unique identifier for this cell.
-  constexpr uint64_t id() const { return id_; }
-
-  // Return true if id() represents a valid cell.
-  //
-  // All methods require is_valid() to be true unless otherwise specified
-  // (although not all methods enforce this).
-  bool is_valid() const;
-
-  // Which cube face this cell belongs to, in the range 0..5.
-  int face() const;
-
-  // The position of the cell center along the Hilbert curve over this face,
-  // in the range 0..(2**kPosBits-1).
-  uint64_t pos() const;
-
-  // Return the subdivision level of the cell (range 0..kMaxLevel).
-  int level() const;
-
-  // Return the edge length of this cell in (i,j)-space.
-  int GetSizeIJ() const;
-
-  // Like the above, but return the size of cells at the given level.
-  static int GetSizeIJ(int level);
-
-  // Return true if this is a leaf cell (more efficient than checking
-  // whether level() == kMaxLevel).
-  bool is_leaf() const;
-
-  // Return true if this is a top-level face cell (more efficient than
-  // checking whether level() == 0).
-  bool is_face() const;
-
-  // Return the child position (0..3) of this cell within its parent.
-  // REQUIRES: level() >= 1.
-  int child_position() const;
-
-  // Return the child position (0..3) of this cell's ancestor at the given
-  // level within its parent.  For example, child_position(1) returns the
-  // position of this cell's level-1 ancestor within its top-level face cell.
-  // REQUIRES: 1 <= level <= this->level().
-  int child_position(int level) const;
-
-  // These methods return the range of cell ids that are contained within this
-  // cell (including itself).  The range is *inclusive* (i.e. test using >=
-  // and <=) and the return values of both methods are valid leaf cell ids.
-  // In other words, a.contains(b) if and only if
-  //
-  //     (b >= a.range_min() && b <= a.range_max())
-  //
-  // If you want to iterate through all the descendants of this cell at a
-  // particular level, use child_begin(level) and child_end(level) instead.
-  // Also see maximum_tile(), which can be used to iterate through a range of
-  // cells using S2CellIds at different levels that are as large as possible.
-  //
-  // If you need to convert the range to a semi-open interval [min, limit)
-  // (e.g., in order to use a key-value store that only supports semi-open
-  // range queries), do not attempt to define "limit" as range_max.next().
-  // The problem is that leaf S2CellIds are 2 units apart, so the semi-open
-  // interval [min, limit) includes an additional value (range_max.id() + 1)
-  // which happens to be a valid S2CellId about one-third of the time and
-  // is *never* contained by this cell.  (It always corresponds to a cell that
-  // is larger than this one.)  You can define "limit" as (range_max.id() + 1)
-  // if necessary (which is not always a valid S2CellId but can still be used
-  // with FromToken/ToToken), or you can convert range_max() to the key space
-  // of your key-value store and define "limit" as Successor(key).
-  //
-  // Note that Sentinel().range_min() == Sentinel.range_max() == Sentinel().
-  IFNDEF_SWIG(ABSL_MUST_USE_RESULT) S2CellId range_min() const;
-  IFNDEF_SWIG(ABSL_MUST_USE_RESULT) S2CellId range_max() const;
-
-  // Return true if the given cell is contained within this one.
-  bool contains(S2CellId other) const;
-
-  // Return true if the given cell intersects this one.
-  bool intersects(S2CellId other) const;
-
-  // Return the cell at the previous level or at the given level (which must
-  // be less than or equal to the current level).
-  IFNDEF_SWIG(ABSL_MUST_USE_RESULT) S2CellId parent() const;
-  IFNDEF_SWIG(ABSL_MUST_USE_RESULT) S2CellId parent(int level) const;
-
-  // Return the immediate child of this cell at the given traversal order
-  // position (in the range 0 to 3).  This cell must not be a leaf cell.
-  IFNDEF_SWIG(ABSL_MUST_USE_RESULT) S2CellId child(int position) const;
-
-  // Iterator-style methods for traversing the immediate children of a cell or
-  // all of the children at a given level (greater than or equal to the current
-  // level).  Note that the end value is exclusive, just like standard STL
-  // iterators, and may not even be a valid cell id.  You should iterate using
-  // code like this:
-  //
-  //   for(S2CellId c = id.child_begin(); c != id.child_end(); c = c.next())
-  //     ...
-  //
-  // The convention for advancing the iterator is "c = c.next()" rather
-  // than "++c" to avoid possible confusion with incrementing the
-  // underlying 64-bit cell id.
-  IFNDEF_SWIG(ABSL_MUST_USE_RESULT) S2CellId child_begin() const;
-  IFNDEF_SWIG(ABSL_MUST_USE_RESULT) S2CellId child_begin(int level) const;
-  IFNDEF_SWIG(ABSL_MUST_USE_RESULT) S2CellId child_end() const;
-  IFNDEF_SWIG(ABSL_MUST_USE_RESULT) S2CellId child_end(int level) const;
-
-  // Return the next/previous cell at the same level along the Hilbert curve.
-  // Works correctly when advancing from one face to the next, but
-  // does *not* wrap around from the last face to the first or vice versa.
-  IFNDEF_SWIG(ABSL_MUST_USE_RESULT) S2CellId next() const;
-  IFNDEF_SWIG(ABSL_MUST_USE_RESULT) S2CellId prev() const;
-
-  // This method advances or retreats the indicated number of steps along the
-  // Hilbert curve at the current level, and returns the new position.  The
-  // position is never advanced past End() or before Begin().
-  IFNDEF_SWIG(ABSL_MUST_USE_RESULT) S2CellId advance(int64_t steps) const;
-
-  // Returns the number of steps that this cell is from Begin(level()). The
-  // return value is always non-negative.
-  int64_t distance_from_begin() const;
-
-  // Like next() and prev(), but these methods wrap around from the last face
-  // to the first and vice versa.  They should *not* be used for iteration in
-  // conjunction with child_begin(), child_end(), Begin(), or End().  The
-  // input must be a valid cell id.
-  IFNDEF_SWIG(ABSL_MUST_USE_RESULT) S2CellId next_wrap() const;
-  IFNDEF_SWIG(ABSL_MUST_USE_RESULT) S2CellId prev_wrap() const;
-
-  // This method advances or retreats the indicated number of steps along the
-  // Hilbert curve at the current level, and returns the new position.  The
-  // position wraps between the first and last faces as necessary.  The input
-  // must be a valid cell id.
-  IFNDEF_SWIG(ABSL_MUST_USE_RESULT) S2CellId advance_wrap(int64_t steps) const;
-
-  // Return the largest cell with the same range_min() and such that
-  // range_max() < limit.range_min().  Returns "limit" if no such cell exists.
-  // This method can be used to generate a small set of S2CellIds that covers
-  // a given range (a "tiling").  This example shows how to generate a tiling
-  // for a semi-open range of leaf cells [start, limit):
-  //
-  //   for (S2CellId id = start.maximum_tile(limit);
-  //        id != limit; id = id.next().maximum_tile(limit)) { ... }
-  //
-  // Note that in general the cells in the tiling will be of different sizes;
-  // they gradually get larger (near the middle of the range) and then
-  // gradually get smaller (as "limit" is approached).
-  IFNDEF_SWIG(ABSL_MUST_USE_RESULT) S2CellId maximum_tile(S2CellId limit) const;
-
-  // Returns the level of the lowest common ancestor of this cell and "other",
-  // i.e. the maximum level where this->parent(level) == other.parent(level).
-  // Note that this definition also covers the situation where this cell is a
-  // descendant of "other" or vice versa, or the two cells are the same,
-  // since this->parent(this->level()) == *this.
-  //
-  // Returns -1 if the two cells do not have any common ancestor (i.e., they
-  // are from different faces).
-  int GetCommonAncestorLevel(S2CellId other) const;
-
-  // Iterator-style methods for traversing all the cells along the Hilbert
-  // curve at a given level (across all 6 faces of the cube).  Note that the
-  // end value is exclusive (just like standard STL iterators), and is not a
-  // valid cell id.
-  static S2CellId Begin(int level);
-  static S2CellId End(int level);
-
-  // Methods to encode and decode cell ids to compact text strings suitable
-  // for display or indexing.  Cells at lower levels (i.e. larger cells) are
-  // encoded into fewer characters.  The maximum token length is 16.
-  //
-  // Tokens preserve ordering, i.e. ToToken(x) < ToToken(y) iff x < y.
-  //
-  // ToToken() returns a string by value for convenience; the compiler
-  // does this without intermediate copying in most cases.
-  //
-  // These methods guarantee that FromToken(ToToken(x)) == x even when
-  // "x" is an invalid cell id.  All tokens are alphanumeric strings.
-  // FromToken() returns S2CellId::None() for malformed inputs.
-  std::string ToToken() const;
-  static S2CellId FromToken(absl::string_view token);
-
-  // Legacy coder for S2CellId that delegates to the token representation.
-  // Storage is variable depending on the level of the cell.
-  class Coder : public s2coding::S2Coder<S2CellId> {
-   public:
-    void Encode(Encoder& encoder, const S2CellId& v) const override;
-    bool Decode(Decoder& decoder, S2CellId& v, S2Error& error) const override;
-  };
-
-  // Use encoder to generate a serialized representation of this cell id.
-  // Can also encode an invalid cell.
-  void Encode(Encoder* encoder) const;
-
-  // Decodes an S2CellId encoded by Encode(). Returns true on success.
-  bool Decode(Decoder* decoder);
-
-  // Creates a human readable debug string.  Used for << and available for
-  // direct usage as well.  The format is "f/dd..d" where "f" is a digit in
-  // the range [0-5] representing the S2CellId face, and "dd..d" is a string
-  // of digits in the range [0-3] representing each child's position with
-  // respect to its parent.  (Note that the latter string may be empty.)
-  //
-  // For example "4/" represents S2CellId::FromFace(4), and "3/02" represents
-  // S2CellId::FromFace(3).child(0).child(2).
-  std::string ToString() const;
-
-  // Converts a string in the format returned by ToString() to an S2CellId.
-  // Returns S2CellId::None() if the string could not be parsed.
-  //
-  // The method name includes "Debug" in order to avoid possible confusion
-  // with FromToken() above.
-  static S2CellId FromDebugString(absl::string_view str);
-
-  // Return the four cells that are adjacent across the cell's four edges.
-  // Neighbors are returned in the order defined by S2Cell::GetEdge.  All
-  // neighbors are guaranteed to be distinct.
-  void GetEdgeNeighbors(S2CellId neighbors[4]) const;
-
-  // Return the S2CellIds of the neighbors of the closest vertex to this cell
-  // at the given level, by appending them to "output".  Normally there are four
-  // neighbors, but the closest vertex may only have three neighbors if it is
-  // one of the 8 cube vertices.
-  //
-  // Requires: level < this->level(), so that we can determine which vertex is
-  // closest (in particular, level == kMaxLevel is not allowed).
-  void AppendVertexNeighbors(int level, std::vector<S2CellId>* output) const;
-
-  // Append all neighbors of this cell at the given level to "output".  Two
-  // cells X and Y are neighbors if their boundaries intersect but their
-  // interiors do not.  In particular, two cells that intersect at a single
-  // point are neighbors.  Note that for cells adjacent to a face vertex, the
-  // same neighbor may be appended more than once.
-  //
-  // REQUIRES: nbr_level >= this->level().
-  void AppendAllNeighbors(int nbr_level, std::vector<S2CellId>* output) const;
-
-  /////////////////////////////////////////////////////////////////////
-  // Low-level methods.
-
-  // Return a leaf cell given its cube face (range 0..5) and
-  // i- and j-coordinates (see s2coords.h).
-  static S2CellId FromFaceIJ(int face, int i, int j);
-
-  // Return the (face, i, j) coordinates for the leaf cell corresponding to
-  // this cell id.  Since cells are represented by the Hilbert curve position
-  // at the center of the cell, the returned (i,j) for non-leaf cells will be
-  // a leaf cell adjacent to the cell center.  If "orientation" is non-nullptr,
-  // also return the Hilbert curve orientation for the current cell.
-  int ToFaceIJOrientation(int* pi, int* pj, int* orientation) const;
-
-  // Return the lowest-numbered bit that is on for this cell id, which is
-  // equal to (uint64_t{1} << (2 * (kMaxLevel - level))).  So for example,
-  // a.lsb() <= b.lsb() if and only if a.level() >= b.level(), but the
-  // first test is more efficient.
-  uint64_t lsb() const { return id_ & (~id_ + 1); }
-
-  // Return the lowest-numbered bit that is on for cells at the given level.
-  static constexpr uint64_t lsb_for_level(int level) {
-    return uint64_t{1} << (2 * (kMaxLevel - level));
-  }
-
-  // Return the bound in (u,v)-space for the cell at the given level containing
-  // the leaf cell with the given (i,j)-coordinates.
-  static R2Rect IJLevelToBoundUV(int ij[2], int level);
-
-  // When S2CellId is used as a key in one of the absl::btree container types,
-  // indicate that linear rather than binary search should be used.  This is
-  // much faster when the comparison function is cheap.
-  typedef std::true_type absl_btree_prefer_linear_node_search;
-
- private:
-  // This is the offset required to wrap around from the beginning of the
-  // Hilbert curve to the end or vice versa; see next_wrap() and prev_wrap().
-  // SWIG doesn't understand uint64_t{}, so use static_cast.
-  static constexpr uint64_t kWrapOffset =
-      static_cast<uint64_t>(kNumFaces) << kPosBits;
-
-  // Given a face and a point (i,j) where either i or j is outside the valid
-  // range [0..kMaxSize-1], this function first determines which neighboring
-  // face "contains" (i,j), and then returns the leaf cell on that face which
-  // is adjacent to the given face and whose distance from (i,j) is minimal.
-  static S2CellId FromFaceIJWrap(int face, int i, int j);
-
-  // Inline helper function that calls FromFaceIJ if "same_face" is true,
-  // or FromFaceIJWrap if "same_face" is false.
-  static S2CellId FromFaceIJSame(int face, int i, int j, bool same_face);
-
-  uint64_t id_ = 0;       // 0 is an invalid cell id.
-} ABSL_ATTRIBUTE_PACKED;  // Necessary so that structures containing S2CellId's
-                          // can be ABSL_ATTRIBUTE_PACKED.
-
-inline constexpr bool operator==(S2CellId x, S2CellId y) {
-  return x.id() == y.id();
-}
-
-inline constexpr bool operator!=(S2CellId x, S2CellId y) {
-  return x.id() != y.id();
-}
-
-inline constexpr bool operator<(S2CellId x, S2CellId y) {
-  return x.id() < y.id();
-}
-
-inline constexpr bool operator>(S2CellId x, S2CellId y) {
-  return x.id() > y.id();
-}
-
-inline constexpr bool operator<=(S2CellId x, S2CellId y) {
-  return x.id() <= y.id();
-}
-
-inline constexpr bool operator>=(S2CellId x, S2CellId y) {
-  return x.id() >= y.id();
-}
-
-inline S2CellId S2CellId::FromFace(int face) {
-  return S2CellId((static_cast<uint64_t>(face) << kPosBits) + lsb_for_level(0));
-}
-
-inline S2CellId S2CellId::FromFacePosLevel(int face, uint64_t pos, int level) {
-  S2CellId cell((static_cast<uint64_t>(face) << kPosBits) + (pos | 1));
-  // `parent` `ABSL_DCHECK`s level, so don't do it here.
-  return cell.parent(level);
-}
-
-inline int S2CellId::GetCenterSiTi(int* psi, int* pti) const {
-  // First we compute the discrete (i,j) coordinates of a leaf cell contained
-  // within the given cell.  Given that cells are represented by the Hilbert
-  // curve position corresponding at their center, it turns out that the cell
-  // returned by ToFaceIJOrientation is always one of two leaf cells closest
-  // to the center of the cell (unless the given cell is a leaf cell itself,
-  // in which case there is only one possibility).
-  //
-  // Given a cell of size s >= 2 (i.e. not a leaf cell), and letting (imin,
-  // jmin) be the coordinates of its lower left-hand corner, the leaf cell
-  // returned by ToFaceIJOrientation() is either (imin + s/2, jmin + s/2)
-  // (imin + s/2 - 1, jmin + s/2 - 1).  The first case is the one we want.
-  // We can distinguish these two cases by looking at the low bit of "i" or
-  // "j".  In the second case the low bit is one, unless s == 2 (i.e. the
-  // level just above leaf cells) in which case the low bit is zero.
-  //
-  // In the code below, the expression ((i ^ (int(id_) >> 2)) & 1) is true
-  // if we are in the second case described above.
-  int i, j;
-  int face = ToFaceIJOrientation(&i, &j, nullptr);
-  int delta = is_leaf() ? 1 : ((i ^ (static_cast<int>(id_) >> 2)) & 1) ? 2 : 0;
-
-  // Note that (2 * {i,j} + delta) will never overflow a 32-bit integer.
-  *psi = 2 * i + delta;
-  *pti = 2 * j + delta;
-  return face;
-}
-
-inline bool S2CellId::is_valid() const {
-  return (face() < kNumFaces && (lsb() & 0x1555555555555555ULL));
-}
-
-inline int S2CellId::face() const {
-  return id_ >> kPosBits;
-}
-
-inline uint64_t S2CellId::pos() const {
-  return id_ & (~uint64_t{0} >> kFaceBits);
-}
-
-inline int S2CellId::level() const {
-  // We can't just ABSL_DCHECK(is_valid()) because we want level() to be
-  // defined for end-iterators, i.e. S2CellId::End(kLevel).  However there is
-  // no good way to define S2CellId::None().level(), so we do prohibit that.
-  ABSL_ASSUME(id_ != 0);
-
-  // A special case for leaf cells is not worthwhile.
-  return kMaxLevel - (absl::countr_zero(id_) >> 1);
-}
-
-inline int S2CellId::GetSizeIJ() const {
-  return GetSizeIJ(level());
-}
-
-inline double S2CellId::GetSizeST() const {
-  return GetSizeST(level());
-}
-
-inline int S2CellId::GetSizeIJ(int level) {
-  ABSL_DCHECK_GE(level, 0);
-  ABSL_DCHECK_LE(level, kMaxLevel);
-  return 1 << (kMaxLevel - level);
-}
-
-inline double S2CellId::GetSizeST(int level) {
-  // `GetSizeIJ` `ABSL_DCHECK`s `level`, so don't do it here.
-  return S2::IJtoSTMin(GetSizeIJ(level));
-}
-
-inline bool S2CellId::is_leaf() const { return id_ & 1; }
-
-inline bool S2CellId::is_face() const {
-  return (id_ & (lsb_for_level(0) - 1)) == 0;
-}
-
-inline int S2CellId::child_position() const {
-  // No need for a special implementation; the compiler optimizes this well.
-  return child_position(level());
-}
-
-inline int S2CellId::child_position(int level) const {
-  ABSL_DCHECK(is_valid());
-  ABSL_DCHECK_GE(level, 1);
-  ABSL_DCHECK_LE(level, this->level());
-  return static_cast<int>(id_ >> (2 * (kMaxLevel - level) + 1)) & 3;
-}
-
-inline S2CellId S2CellId::range_min() const {
-  return S2CellId(id_ - (lsb() - 1));
-}
-
-inline S2CellId S2CellId::range_max() const {
-  return S2CellId(id_ + (lsb() - 1));
-}
-
-inline bool S2CellId::contains(S2CellId other) const {
-  ABSL_DCHECK(is_valid());
-  ABSL_DCHECK(other.is_valid());
-  return other >= range_min() && other <= range_max();
-}
-
-inline bool S2CellId::intersects(S2CellId other) const {
-  ABSL_DCHECK(is_valid());
-  ABSL_DCHECK(other.is_valid());
-  return other.range_min() <= range_max() && other.range_max() >= range_min();
-}
-
-inline S2CellId S2CellId::parent(int level) const {
-  ABSL_DCHECK(is_valid());
-  ABSL_DCHECK_GE(level, 0);
-  ABSL_DCHECK_LE(level, this->level());
-  uint64_t new_lsb = lsb_for_level(level);
-  return S2CellId((id_ & (~new_lsb + 1)) | new_lsb);
-}
-
-inline S2CellId S2CellId::parent() const {
-  ABSL_DCHECK(is_valid());
-  ABSL_DCHECK(!is_face());
-  uint64_t new_lsb = lsb() << 2;
-  return S2CellId((id_ & (~new_lsb + 1)) | new_lsb);
-}
-
-inline S2CellId S2CellId::child(int position) const {
-  ABSL_DCHECK(is_valid());
-  ABSL_DCHECK(!is_leaf());
-  // To change the level, we need to move the least-significant bit two
-  // positions downward.  We do this by subtracting (4 * new_lsb) and adding
-  // new_lsb.  Then to advance to the given child cell, we add
-  // (2 * position * new_lsb).
-  uint64_t new_lsb = lsb() >> 2;
-  return S2CellId(id_ + (2 * position + 1 - 4) * new_lsb);
-}
-
-inline S2CellId S2CellId::child_begin() const {
-  ABSL_DCHECK(is_valid());
-  ABSL_DCHECK(!is_leaf());
-  uint64_t old_lsb = lsb();
-  return S2CellId(id_ - old_lsb + (old_lsb >> 2));
-}
-
-inline S2CellId S2CellId::child_begin(int level) const {
-  ABSL_DCHECK(is_valid());
-  ABSL_DCHECK_GE(level, this->level());
-  ABSL_DCHECK_LE(level, kMaxLevel);
-  return S2CellId(id_ - lsb() + lsb_for_level(level));
-}
-
-inline S2CellId S2CellId::child_end() const {
-  ABSL_DCHECK(is_valid());
-  ABSL_DCHECK(!is_leaf());
-  uint64_t old_lsb = lsb();
-  return S2CellId(id_ + old_lsb + (old_lsb >> 2));
-}
-
-inline S2CellId S2CellId::child_end(int level) const {
-  ABSL_DCHECK(is_valid());
-  ABSL_DCHECK_GE(level, this->level());
-  ABSL_DCHECK_LE(level, kMaxLevel);
-  return S2CellId(id_ + lsb() + lsb_for_level(level));
-}
-
-inline S2CellId S2CellId::next() const {
-  return S2CellId(id_ + (lsb() << 1));
-}
-
-inline S2CellId S2CellId::prev() const {
-  return S2CellId(id_ - (lsb() << 1));
-}
-
-inline S2CellId S2CellId::next_wrap() const {
-  ABSL_DCHECK(is_valid());
-  S2CellId n = next();
-  if (n.id_ < kWrapOffset) return n;
-  return S2CellId(n.id_ - kWrapOffset);
-}
-
-inline S2CellId S2CellId::prev_wrap() const {
-  ABSL_DCHECK(is_valid());
-  S2CellId p = prev();
-  if (p.id_ < kWrapOffset) return p;
-  return S2CellId(p.id_ + kWrapOffset);
-}
-
-inline S2CellId S2CellId::Begin(int level) {
-  // `child_begin` `ABSL_DCHECK`s level, so don't do it here.
-  return FromFace(0).child_begin(level);
-}
-
-inline S2CellId S2CellId::End(int level) {
-  // `child_end` `ABSL_DCHECK`s level, so don't do it here.
-  return FromFace(5).child_end(level);
-}
-
-std::ostream& operator<<(std::ostream& os, S2CellId id);
+public:
+    static constexpr int kFaceBits = 3;
+    static constexpr int kNumFaces = 6;
+    static constexpr int kLevelBits = 5;
+    static constexpr int kMaxLevel = 28; // 限制到28层
+    static constexpr int kPosBits = 2 * kMaxLevel + 1; // 保持兼容性
+    static constexpr int kMaxSize = 1 << kMaxLevel; // 叶子层级的最大尺寸
+    static constexpr int kPathBits = 64 - kFaceBits - kLevelBits; // 56位
+    static constexpr uint64_t kFaceMask = (1ULL << kFaceBits) - 1;
+    static constexpr uint64_t kLevelMask = (1ULL << kLevelBits) - 1;
+    
+    // 默认构造函数
+    S2CellId() = default;
+    
+    // 创建无效的S2CellId
+    static constexpr S2CellId None() { return S2CellId(); }
+    
+    // 从新编码构造
+    explicit constexpr S2CellId(uint64_t new_id) : new_id_(new_id) {}
+    
+    // 从原OriginalS2CellId构造
+    explicit S2CellId(const OriginalS2CellId& old_id) {
+        new_id_ = ConvertFromOldFormat(old_id);
+    }
+    
+    // 从S2Point构造
+    explicit S2CellId(const S2Point& point) {
+        OriginalS2CellId old_id(point);
+        if (old_id.level() > kMaxLevel) {
+            old_id = old_id.parent(kMaxLevel);
+        }
+        new_id_ = ConvertFromOldFormat(old_id);
+    }
+    
+    // 从S2LatLng构造
+    explicit S2CellId(const S2LatLng& latlng) {
+        OriginalS2CellId old_id(latlng);
+        if (old_id.level() > kMaxLevel) {
+            old_id = old_id.parent(kMaxLevel);
+        }
+        new_id_ = ConvertFromOldFormat(old_id);
+    }
+    
+    // 从OriginalS2CellId构造（推荐使用的方法名）
+    static S2CellId FromS2CellId(const OriginalS2CellId& old_id) {
+        return S2CellId(old_id);
+    }
+    
+    // 检查是否可以用新格式完全表示
+    static bool CanRepresentInNewFormat(const OriginalS2CellId& old_id) {
+        return old_id.level() <= kMaxLevel;
+    }
+    
+    // 从face和level构造
+    static S2CellId FromFaceLevel(int face, int level) {
+        if (face < 0 || face > 5 || level < 0 || level > kMaxLevel) {
+            return S2CellId(); // 返回无效ID
+        }
+        
+        if (level == 0) {
+            // 根节点，直接构造
+            uint64_t id = (static_cast<uint64_t>(face) << (64 - kFaceBits)) | 
+                          static_cast<uint64_t>(level);
+            // 对于face=0, level=0的情况，new_id会是0，这会被is_valid()判断为无效
+            // 我们需要确保有效的cell都有非零的new_id
+            if (id == 0) {
+                // 设置一个特殊标记位，表示这是有效的face=0根节点
+                id = 1ULL << (kLevelBits + kPathBits - 1); // 设置path的最高位
+            }
+            return S2CellId(id);
+        } else {
+            // 非根节点，使用FromFacePosLevel创建第一个子cell
+            OriginalS2CellId old_id = OriginalS2CellId::FromFacePosLevel(face, 0, level);
+            if (!old_id.is_valid()) {
+                return S2CellId(); // 返回无效ID
+            }
+            return S2CellId(old_id);
+        }
+    }
+    
+    // 从点构造
+    static S2CellId FromPoint(const S2Point& point) {
+        OriginalS2CellId old_id(point);
+        // 如果原始ID的层级超过支持范围，选择一个合适的层级
+        if (old_id.level() > kMaxLevel) {
+            // 获取指定层级的祖先cell
+            OriginalS2CellId ancestor = old_id.parent(kMaxLevel);
+            return S2CellId(ancestor);
+        }
+        return S2CellId(old_id);
+    }
+    
+    // 从经纬度构造
+    static S2CellId FromLatLng(const S2LatLng& latlng) {
+        OriginalS2CellId old_id(latlng);
+        // 如果原始ID的层级超过支持范围，选择一个合适的层级
+        if (old_id.level() > kMaxLevel) {
+            // 获取指定层级的祖先cell
+            OriginalS2CellId ancestor = old_id.parent(kMaxLevel);
+            return S2CellId(ancestor);
+        }
+        return S2CellId(old_id);
+    }
+    
+    // ==================== 静态工厂方法（委托实现） ====================
+    
+    static S2CellId FromFace(int face) {
+        OriginalS2CellId old_id = OriginalS2CellId::FromFace(face);
+        return S2CellId(old_id);
+    }
+    
+    static S2CellId FromFacePosLevel(int face, uint64_t pos, int level) {
+        if (level > kMaxLevel) return S2CellId(); // 超出支持范围
+        
+        OriginalS2CellId old_id = OriginalS2CellId::FromFacePosLevel(face, pos, level);
+        return S2CellId(old_id);
+    }
+    
+    static S2CellId FromFaceIJ(int face, int i, int j) {
+        OriginalS2CellId old_id = OriginalS2CellId::FromFaceIJ(face, i, j);
+        if (old_id.level() > kMaxLevel) {
+            // 如果层级太高，选择合适的祖先
+            old_id = old_id.parent(kMaxLevel);
+        }
+        return S2CellId(old_id);
+    }
+    
+    static S2CellId FromToken(absl::string_view token) {
+        OriginalS2CellId old_id = OriginalS2CellId::FromToken(token);
+        if (!old_id.is_valid()) return S2CellId();
+        
+        if (old_id.level() > kMaxLevel) {
+            old_id = old_id.parent(kMaxLevel);
+        }
+        return S2CellId(old_id);
+    }
+    
+    static S2CellId Begin(int level) {
+        if (level > kMaxLevel) return S2CellId();
+        
+        OriginalS2CellId old_id = OriginalS2CellId::Begin(level);
+        return S2CellId(old_id);
+    }
+    
+    static S2CellId End(int level) {
+        if (level > kMaxLevel) return S2CellId();
+        
+        OriginalS2CellId old_id = OriginalS2CellId::End(level);
+        return S2CellId(old_id);
+    }
+    
+    static constexpr S2CellId Sentinel() {
+        return S2CellId(~uint64_t{0});
+    }
+    
+    // 获取新编码ID
+    uint64_t new_id() const { return new_id_; }
+    
+    // 转换为原OriginalS2CellId格式
+    OriginalS2CellId ToOldFormat() const {
+        return ConvertToOldFormat(new_id_);
+    }
+    
+    // 转换为OriginalS2CellId（推荐使用的方法名）
+    OriginalS2CellId ToS2CellId() const {
+        return ConvertToOldFormat(new_id_);
+    }
+    
+    // ==================== 位置和几何属性（委托实现） ====================
+    
+    uint64_t id() const {
+        return ToOldFormat().id();
+    }
+    
+    // 获取新格式的ID（避免混淆）
+    uint64_t id_v2() const {
+        return new_id_;
+    }
+    
+    uint64_t pos() const {
+        return ToOldFormat().pos();
+    }
+    
+    int GetSizeIJ() const {
+        return ToOldFormat().GetSizeIJ();
+    }
+    
+    static int GetSizeIJ(int level) {
+        return OriginalS2CellId::GetSizeIJ(level);
+    }
+    
+    double GetSizeST() const {
+        return ToOldFormat().GetSizeST();
+    }
+    
+    static double GetSizeST(int level) {
+        return OriginalS2CellId::GetSizeST(level);
+    }
+    
+    // 基本属性获取
+    int face() const {
+        // 特殊处理：对于face=0, level=0的根节点，我们使用了特殊标记位
+        if (new_id_ == (1ULL << (kLevelBits + kPathBits - 1))) {
+            return 0;
+        }
+        return static_cast<int>(new_id_ >> (64 - kFaceBits));
+    }
+    
+    int level() const {
+        // 特殊处理：对于face=0, level=0的根节点，我们使用了特殊标记位
+        if (new_id_ == (1ULL << (kLevelBits + kPathBits - 1))) {
+            return 0;
+        }
+        return static_cast<int>(new_id_ & kLevelMask);
+    }
+    
+    uint64_t path() const {
+        int l = level();
+        if (l == 0) return 0; // 根节点没有路径
+        
+        uint64_t mask = (1ULL << kPathBits) - 1;
+        uint64_t raw_path = (new_id_ >> kLevelBits) & mask;
+        
+        // 只返回有效的路径位，避免包含无关的高位
+        if (l > 0 && l <= kMaxLevel) { // 确保level在有效范围内
+            int shift_bits = l * 2;
+            // 由于kMaxLevel=28，shift_bits最大为56，所以移位是安全的
+            uint64_t valid_path_mask = (1ULL << shift_bits) - 1;
+            return raw_path & valid_path_mask;
+        }
+        
+        return raw_path;
+    }
+    
+    // 检查有效性
+    bool is_valid() const {
+        if (new_id_ == 0) return false;
+        
+        int f = static_cast<int>(new_id_ >> (64 - kFaceBits));
+        int l = static_cast<int>(new_id_ & kLevelMask);
+        
+        // 特殊处理：对于face=0, level=0的根节点，我们使用了特殊标记位
+        // 检查是否是这种特殊情况
+        if (l == 0 && f == 0 && new_id_ == (1ULL << (kLevelBits + kPathBits - 1))) {
+            return true;
+        }
+        
+        // 快速检查face和level范围
+        if (f < 0 || f >= 6) return false;
+        if (l < 0 || l > kMaxLevel) return false;
+        
+        // 对于根节点，不需要检查路径
+        if (l == 0) return true;
+        
+        // 检查路径的有效性
+        uint64_t mask = (1ULL << kPathBits) - 1;
+        uint64_t current_path = (new_id_ >> kLevelBits) & mask;
+        
+        // 检查路径是否符合层级要求 - 路径的高位应该为0
+        if (l > 0) { // 对于非根节点，需要检查路径有效性
+            // 路径应该只使用l*2位，高位应该为0
+            int used_bits = l * 2;
+            if (used_bits < kPathBits) {
+                uint64_t high_bits_mask = ~((1ULL << used_bits) - 1);
+                if ((current_path & high_bits_mask) != 0) return false;
+            }
+        }
+        
+        return true;
+    }
+    
+    // 层级关系操作
+    S2CellId parent() const {
+        if (!is_valid()) return S2CellId();
+        
+        if (level() == 0) return S2CellId(); // 根节点没有父节点
+        
+        int parent_level = level() - 1;
+        uint64_t parent_path = path() >> 2;
+        
+        uint64_t parent_id = (static_cast<uint64_t>(face()) << (64 - kFaceBits)) |
+                            (parent_path << kLevelBits) |
+                            static_cast<uint64_t>(parent_level);
+        
+        // 特殊处理：对于face=0, level=0的根节点，需要设置特殊标记
+        if (parent_id == 0) {
+            parent_id = 1ULL << (kLevelBits + kPathBits - 1);
+        }
+        
+        return S2CellId(parent_id);
+    }
+    
+    // 获取指定层级的父节点
+    S2CellId parent(int target_level) const {
+        if (target_level < 0 || target_level > kMaxLevel) return S2CellId();
+        if (target_level >= level()) return *this;
+        
+        // 对于大跨度的层级跳跃，使用委托实现更安全
+        if (level() - target_level > 5) {
+            OriginalS2CellId old_format = ToOldFormat();
+            OriginalS2CellId parent_old = old_format.parent(target_level);
+            return S2CellId(parent_old);
+        }
+        
+        // 对于小跨度，使用直接实现
+        S2CellId current = *this;
+        while (current.level() > target_level) {
+            current = current.parent();
+        }
+        return current;
+    }
+    
+    S2CellId child(int position) const {
+        if (!is_valid()) return S2CellId();
+        if (position < 0 || position >= 4) return S2CellId(); // 无效位置
+        
+        if (level() >= kMaxLevel) return S2CellId(); // 已经是最大层级
+        
+        int child_level = level() + 1;
+        uint64_t child_path = (path() << 2) | static_cast<uint64_t>(position);
+        
+        uint64_t child_id = (static_cast<uint64_t>(face()) << (64 - kFaceBits)) |
+                           (child_path << kLevelBits) |
+                           static_cast<uint64_t>(child_level);
+        
+        return S2CellId(child_id);
+    }
+    
+    // ==================== 坐标转换（委托实现） ====================
+    
+    S2Point ToPointRaw() const {
+        return ToOldFormat().ToPointRaw();
+    }
+    
+    R2Point GetCenterST() const {
+        return ToOldFormat().GetCenterST();
+    }
+    
+    R2Point GetCenterUV() const {
+        return ToOldFormat().GetCenterUV();
+    }
+    
+    R2Rect GetBoundST() const {
+        return ToOldFormat().GetBoundST();
+    }
+    
+    R2Rect GetBoundUV() const {
+        return ToOldFormat().GetBoundUV();
+    }
+    
+    int ToFaceIJOrientation(int* pi, int* pj, int* orientation) const {
+        return ToOldFormat().ToFaceIJOrientation(pi, pj, orientation);
+    }
+    
+    int GetCenterSiTi(int* psi, int* pti) const {
+        return ToOldFormat().GetCenterSiTi(psi, pti);
+    }
+    
+    // ==================== 层级关系（部分委托实现） ====================
+    
+    // ==================== 范围操作（委托实现） ====================
+    
+    S2CellId range_min() const {
+        if (!is_valid()) return S2CellId(); // Invalid input returns invalid output
+        
+        OriginalS2CellId old_format = ToOldFormat();
+        if (!old_format.is_valid()) return S2CellId(); // Failed conversion
+        
+        OriginalS2CellId range_min_old = old_format.range_min();
+        if (!range_min_old.is_valid()) return S2CellId(); // Invalid range_min
+        
+        // Check if the range_min level exceeds our limit
+        if (range_min_old.level() > kMaxLevel) {
+            range_min_old = range_min_old.parent(kMaxLevel);
+        }
+        
+        return S2CellId(range_min_old);
+    }
+    
+    S2CellId range_max() const {
+        if (!is_valid()) return S2CellId(); // Invalid input returns invalid output
+        
+        OriginalS2CellId old_format = ToOldFormat();
+        if (!old_format.is_valid()) return S2CellId(); // Failed conversion
+        
+        OriginalS2CellId range_max_old = old_format.range_max();
+        if (!range_max_old.is_valid()) return S2CellId(); // Invalid range_max
+        
+        // Check if the range_max level exceeds our limit
+        if (range_max_old.level() > kMaxLevel) {
+            range_max_old = range_max_old.parent(kMaxLevel);
+        }
+        
+        return S2CellId(range_max_old);
+    }
+    
+    S2CellId maximum_tile(const S2CellId& limit) const {
+        OriginalS2CellId old_format = ToOldFormat();
+        OriginalS2CellId limit_old = limit.ToOldFormat();
+        OriginalS2CellId result_old = old_format.maximum_tile(limit_old);
+        
+        if (result_old.level() > kMaxLevel) {
+            return S2CellId();
+        }
+        return S2CellId(result_old);
+    }
+    
+    // ==================== 遍历方法（委托实现） ====================
+    
+    S2CellId child_begin() const {
+        if (level() >= kMaxLevel) return S2CellId();
+        return child(0);
+    }
+    
+    S2CellId child_begin(int target_level) const {
+        if (target_level > kMaxLevel || target_level <= level()) return S2CellId();
+        
+        OriginalS2CellId old_format = ToOldFormat();
+        OriginalS2CellId child_old = old_format.child_begin(target_level);
+        return S2CellId(child_old);
+    }
+    
+    S2CellId child_end() const {
+        if (level() >= kMaxLevel) return S2CellId();
+        
+        // 使用委托实现来确保正确性
+        OriginalS2CellId old_format = ToOldFormat();
+        OriginalS2CellId child_end_old = old_format.child_end();
+        
+        if (child_end_old.level() > kMaxLevel) {
+            return S2CellId();
+        }
+        
+        return S2CellId(child_end_old);
+    }
+    
+    S2CellId child_end(int target_level) const {
+        if (target_level > kMaxLevel || target_level <= level()) return S2CellId();
+        
+        OriginalS2CellId old_format = ToOldFormat();
+        OriginalS2CellId child_old = old_format.child_end(target_level);
+        return S2CellId(child_old);
+    }
+    
+    // ==================== 导航方法（委托实现） ====================
+    
+    S2CellId next() const {
+        OriginalS2CellId old_format = ToOldFormat();
+        OriginalS2CellId next_old = old_format.next();
+        
+        // 检查结果是否在支持范围内
+        if (next_old.level() > kMaxLevel) {
+            return S2CellId(); // 超出支持范围
+        }
+        
+        return S2CellId(next_old);
+    }
+    
+    S2CellId prev() const {
+        OriginalS2CellId old_format = ToOldFormat();
+        OriginalS2CellId prev_old = old_format.prev();
+        
+        if (prev_old.level() > kMaxLevel) {
+            return S2CellId();
+        }
+        
+        return S2CellId(prev_old);
+    }
+    
+    S2CellId next_wrap() const {
+        OriginalS2CellId old_format = ToOldFormat();
+        OriginalS2CellId next_old = old_format.next_wrap();
+        
+        if (next_old.level() > kMaxLevel) {
+            return S2CellId();
+        }
+        
+        return S2CellId(next_old);
+    }
+    
+    S2CellId prev_wrap() const {
+        OriginalS2CellId old_format = ToOldFormat();
+        OriginalS2CellId prev_old = old_format.prev_wrap();
+        
+        if (prev_old.level() > kMaxLevel) {
+            return S2CellId();
+        }
+        
+        return S2CellId(prev_old);
+    }
+    
+    S2CellId advance(int64_t steps) const {
+        OriginalS2CellId old_format = ToOldFormat();
+        OriginalS2CellId result_old = old_format.advance(steps);
+        
+        if (result_old.level() > kMaxLevel) {
+            return S2CellId();
+        }
+        
+        return S2CellId(result_old);
+    }
+    
+    S2CellId advance_wrap(int64_t steps) const {
+        OriginalS2CellId old_format = ToOldFormat();
+        OriginalS2CellId result_old = old_format.advance_wrap(steps);
+        
+        if (result_old.level() > kMaxLevel) {
+            return S2CellId();
+        }
+        
+        return S2CellId(result_old);
+    }
+    
+    // ==================== 层级关系分析（委托实现） ====================
+    
+    int GetCommonAncestorLevel(const S2CellId& other) const {
+        OriginalS2CellId old1 = ToOldFormat();
+        OriginalS2CellId old2 = other.ToOldFormat();
+        return old1.GetCommonAncestorLevel(old2);
+    }
+    
+    int64_t distance_from_begin() const {
+        return ToOldFormat().distance_from_begin();
+    }
+    
+    // ==================== 邻居查找（委托实现，需要特殊处理） ====================
+    
+    void GetEdgeNeighbors(S2CellId neighbors[4]) const {
+        if (!neighbors) return; // 空指针检查
+        
+        OriginalS2CellId old_neighbors[4];
+        ToOldFormat().GetEdgeNeighbors(old_neighbors);
+        
+        for (int i = 0; i < 4; ++i) {
+            if (old_neighbors[i].is_valid() && old_neighbors[i].level() <= kMaxLevel) {
+                neighbors[i] = S2CellId(old_neighbors[i]);
+            } else if (old_neighbors[i].is_valid()) {
+                // 如果邻居层级太高，选择合适的祖先
+                neighbors[i] = S2CellId(old_neighbors[i].parent(kMaxLevel));
+            } else {
+                neighbors[i] = S2CellId(); // 无效邻居
+            }
+        }
+    }
+    
+    void AppendVertexNeighbors(int nbr_level, std::vector<S2CellId>* output) const {
+        if (!output) return; // 空指针检查
+        if (nbr_level > kMaxLevel || nbr_level < 0) return; // 超出支持范围
+        
+        std::vector<OriginalS2CellId> old_neighbors;
+        ToOldFormat().AppendVertexNeighbors(nbr_level, &old_neighbors);
+        
+        output->reserve(output->size() + old_neighbors.size());
+        for (const auto& neighbor : old_neighbors) {
+            if (neighbor.is_valid() && neighbor.level() <= kMaxLevel) {
+                output->push_back(S2CellId(neighbor));
+            }
+        }
+    }
+    
+    void AppendAllNeighbors(int nbr_level, std::vector<S2CellId>* output) const {
+        if (!output) return; // 空指针检查
+        if (nbr_level > kMaxLevel || nbr_level < 0) return;
+        
+        std::vector<OriginalS2CellId> old_neighbors;
+        ToOldFormat().AppendAllNeighbors(nbr_level, &old_neighbors);
+        
+        output->reserve(output->size() + old_neighbors.size());
+        for (const auto& neighbor : old_neighbors) {
+            if (neighbor.is_valid() && neighbor.level() <= kMaxLevel) {
+                output->push_back(S2CellId(neighbor));
+            }
+        }
+    }
+    
+    // 委托给原格式的操作
+    S2Point ToPoint() const {
+        return ToOldFormat().ToPoint();
+    }
+    
+    S2LatLng ToLatLng() const {
+        return ToOldFormat().ToLatLng();
+    }
+    
+    bool contains(const S2CellId& other) const {
+        return ToOldFormat().contains(other.ToOldFormat());
+    }
+    
+    bool intersects(const S2CellId& other) const {
+        return ToOldFormat().intersects(other.ToOldFormat());
+    }
+    
+    // ==================== 编码相关（委托实现） ====================
+    
+    std::string ToToken() const {
+        return ToOldFormat().ToToken();
+    }
+    
+    std::string ToDebugString() const {
+        return ToOldFormat().ToString();
+    }
+    
+    // 便利方法
+    bool is_leaf() const {
+        return level() == kMaxLevel;
+    }
+    
+    bool is_face() const {
+        return level() == 0;
+    }
+    
+    // 获取子节点位置
+    int child_position() const {
+        if (!is_valid()) return -1;
+        
+        int l = level();
+        if (l == 0) return -1; // 根节点没有子节点位置
+        
+        // 返回最低层级的子节点位置（路径的最后2位）
+        return static_cast<int>(path() & 3);
+    }
+    
+    // 获取指定层级的子节点位置
+    int child_position(int target_level) const {
+        if (!is_valid()) return -1;
+        
+        int l = level();
+        if (target_level <= 0 || target_level > l) return -1;
+        
+        // 从路径中提取指定层级的子节点位置
+        uint64_t current_path = path();
+        int shift = 2 * (l - target_level);
+        return static_cast<int>((current_path >> shift) & 3);
+    }
+    
+    // 格式化输出
+    std::string ToString() const {
+        if (!is_valid()) return "INVALID";
+        
+        int f = face();
+        int l = level();
+        
+        std::string result = std::to_string(f);
+        
+        if (l == 0) return result; // 根节点只返回face
+        
+        result += "/";
+        
+        // 输出子节点路径
+        uint64_t current_path = path();
+        result.reserve(result.length() + l); // 预分配空间
+        
+        for (int i = l - 1; i >= 0; --i) {
+            int child_pos = static_cast<int>((current_path >> (2 * i)) & 3);
+            result += static_cast<char>('0' + child_pos); // 直接转换为字符
+        }
+        
+        return result;
+    }
+    
+    // 从字符串解析
+    static S2CellId FromString(const std::string& str) {
+        if (str.empty()) return S2CellId();
+        
+        // 解析格式: "face/childpath" 或 "face/" 或 "face"
+        size_t slash_pos = str.find('/');
+        
+        // 提取face部分
+        std::string face_str = (slash_pos == std::string::npos) ? str : str.substr(0, slash_pos);
+        
+        try {
+            int face = std::stoi(face_str);
+            if (face < 0 || face > 5) return S2CellId();
+            
+            // 如果没有斜杠，返回face根节点
+            if (slash_pos == std::string::npos) {
+                return FromFaceLevel(face, 0);
+            }
+            
+            std::string path_str = str.substr(slash_pos + 1);
+            int level = static_cast<int>(path_str.length());
+            
+            // 处理 "face/" 的情况
+            if (level == 0) {
+                return FromFaceLevel(face, 0);
+            }
+            
+            // 检查level范围，避免溢出
+            if (level > kMaxLevel) return S2CellId();
+            
+            uint64_t path = 0;
+            for (int i = 0; i < level; ++i) {
+                char c = path_str[i];
+                if (c < '0' || c > '3') return S2CellId();
+                
+                path = (path << 2) | static_cast<uint64_t>(c - '0');
+            }
+            
+            uint64_t id = (static_cast<uint64_t>(face) << (64 - kFaceBits)) |
+                          (path << kLevelBits) |
+                          static_cast<uint64_t>(level);
+            
+            return S2CellId(id);
+            
+        } catch (const std::exception&) {
+            return S2CellId(); // 解析失败返回无效ID
+        } catch (...) {
+            return S2CellId(); // 捕获所有异常
+        }
+    }
+    
+    // 比较操作符
+    bool operator==(const S2CellId& other) const {
+        return new_id_ == other.new_id_;
+    }
+    
+    bool operator!=(const S2CellId& other) const {
+        return new_id_ != other.new_id_;
+    }
+    
+    bool operator<(const S2CellId& other) const {
+        // For proper S2 ordering, delegate to the original S2CellId comparison
+        return ToOldFormat() < other.ToOldFormat();
+    }
+    
+    // ==================== 其他比较操作符 ====================
+    
+    bool operator>(const S2CellId& other) const {
+        return other < *this;
+    }
+    
+    bool operator<=(const S2CellId& other) const {
+        return !(other < *this);
+    }
+    
+    bool operator>=(const S2CellId& other) const {
+        return !(*this < other);
+    }
+    
+    // ==================== 便捷的类型转换 ====================
+    
+    // 隐式转换到OriginalS2CellId（谨慎使用）
+    operator OriginalS2CellId() const {
+        return ToOldFormat();
+    }
+    
+    // 从OriginalS2CellId赋值
+    S2CellId& operator=(const OriginalS2CellId& old_id) {
+        new_id_ = ConvertFromOldFormat(old_id);
+        return *this;
+    }
+    
+    // 安全的自赋值
+    S2CellId& operator=(const S2CellId& other) {
+        if (this != &other) {
+            new_id_ = other.new_id_;
+        }
+        return *this;
+    }
+    
+    // ==================== 编码/解码方法 ====================
+    
+    // 编码方法（委托给S2CellId）
+    void Encode(Encoder* encoder) const {
+        ToOldFormat().Encode(encoder);
+    }
+    
+    // 解码方法（委托给OriginalS2CellId）
+    bool Decode(Decoder* decoder) {
+        OriginalS2CellId old_id;
+        if (old_id.Decode(decoder)) {
+            if (old_id.level() > kMaxLevel) {
+                old_id = old_id.parent(kMaxLevel);
+            }
+            new_id_ = ConvertFromOldFormat(old_id);
+            return true;
+        }
+        return false;
+    }
+    
+    // ==================== 几何扩展方法 ====================
+    
+    // 扩展边界方法（静态方法，委托给OriginalS2CellId）
+    static R2Rect ExpandedByDistanceUV(const R2Rect& uv, S1Angle distance) {
+        return OriginalS2CellId::ExpandedByDistanceUV(uv, distance);
+    }
+    
+    // IJLevelToBoundUV 静态方法（委托给OriginalS2CellId）
+    static R2Rect IJLevelToBoundUV(int ij[2], int level) {
+        return OriginalS2CellId::IJLevelToBoundUV(ij, level);
+    }
+    
+    // ==================== 缺失的低级方法 ====================
+    
+    // 获取最低有效位
+    uint64_t lsb() const {
+        return ToOldFormat().lsb();
+    }
+    
+    // 获取指定层级的最低有效位
+    static constexpr uint64_t lsb_for_level(int level) {
+        return OriginalS2CellId::lsb_for_level(level);
+    }
+    
+    // 从调试字符串构造
+    static S2CellId FromDebugString(absl::string_view str) {
+        OriginalS2CellId old_id = OriginalS2CellId::FromDebugString(str);
+        if (!old_id.is_valid()) return S2CellId();
+        
+        if (old_id.level() > kMaxLevel) {
+            old_id = old_id.parent(kMaxLevel);
+        }
+        return S2CellId(old_id);
+    }
+    
+    // ==================== Coder类支持 ====================
+    
+    // Coder类的包装，用于序列化
+    class Coder : public s2coding::S2Coder<S2CellId> {
+    public:
+        void Encode(Encoder& encoder, const S2CellId& v) const override {
+            OriginalS2CellId::Coder old_coder;
+            old_coder.Encode(encoder, v.ToOldFormat());
+        }
+        
+        bool Decode(Decoder& decoder, S2CellId& v, S2Error& error) const override {
+            OriginalS2CellId old_value;
+            OriginalS2CellId::Coder old_coder;
+            if (old_coder.Decode(decoder, old_value, error)) {
+                if (old_value.level() > kMaxLevel) {
+                    old_value = old_value.parent(kMaxLevel);
+                }
+                v = S2CellId(old_value);
+                return true;
+            }
+            return false;
+        }
+    };
+    
+private:
+    uint64_t new_id_ = 0;
+    
+    // 转换函数
+    static uint64_t ConvertFromOldFormat(const OriginalS2CellId& old_id) {
+        if (!old_id.is_valid()) return 0;
+        
+        int face = old_id.face();
+        int level = old_id.level();
+        
+        // 检查是否超出支持范围
+        if (level > kMaxLevel) return 0;
+        
+        // 验证face范围
+        if (face < 0 || face >= 6) return 0;
+        
+        // 对于根节点，直接构造
+        if (level == 0) {
+            uint64_t result = (static_cast<uint64_t>(face) << (64 - kFaceBits)) | 0;
+            // 对于face=0, level=0的情况，new_id会是0，这会被is_valid()判断为无效
+            // 我们需要确保有效的cell都有非零的new_id
+            // 解决方案：使用一个"有效位"来标记有效的cell
+            // 我们可以使用path的最高位作为有效位
+            if (result == 0) {
+                // 设置一个特殊标记位，表示这是有效的face=0根节点
+                result = 1ULL << (kLevelBits + kPathBits - 1); // 设置path的最高位
+            }
+            return result;
+        }
+        
+        // 提取子节点路径：从根节点开始，逐级获取子节点位置
+        uint64_t path = 0;
+        OriginalS2CellId current = old_id;
+        
+        // 从叶子节点向上追溯到根节点，收集路径
+        std::vector<int> path_stack;
+        path_stack.reserve(level); // 预分配内存避免重复分配
+        
+        // 从当前节点向上追溯到根节点
+        while (current.level() > 0) {
+            int child_pos = current.child_position();
+            if (child_pos < 0 || child_pos >= 4) {
+                // 无效的子节点位置，返回无效ID
+                return 0;
+            }
+            path_stack.push_back(child_pos);
+            current = current.parent();
+        }
+        
+        // 验证最终的父节点是否为正确的face
+        if (current.face() != face) {
+            return 0; // 路径追溯不一致
+        }
+        
+        // 构建路径（从根到叶子的顺序）
+        for (int i = static_cast<int>(path_stack.size()) - 1; i >= 0; --i) {
+            path = (path << 2) | static_cast<uint64_t>(path_stack[i]);
+        }
+        
+        // 构建最终的新格式ID
+        uint64_t new_id = (static_cast<uint64_t>(face) << (64 - kFaceBits)) |
+                          (path << kLevelBits) |
+                          static_cast<uint64_t>(level);
+        
+        return new_id;
+    }
+    
+    static OriginalS2CellId ConvertToOldFormat(uint64_t new_id) {
+        if (new_id == 0) return OriginalS2CellId::None();
+        
+        // 特殊处理：对于face=0, level=0的根节点，我们使用了特殊标记位
+        if (new_id == (1ULL << (kLevelBits + kPathBits - 1))) {
+            return OriginalS2CellId::FromFace(0);
+        }
+        
+        int face = static_cast<int>(new_id >> (64 - kFaceBits));
+        int level = static_cast<int>(new_id & kLevelMask);
+        
+        // 验证face和level范围
+        if (face < 0 || face >= 6) {
+            return OriginalS2CellId::None(); // 无效face
+        }
+        
+        if (level < 0 || level > kMaxLevel) {
+            return OriginalS2CellId::None(); // 无效level
+        }
+        
+        // 如果是根节点，直接返回
+        if (level == 0) {
+            return OriginalS2CellId::FromFace(face);
+        }
+        
+        // 从路径重建S2CellId
+        OriginalS2CellId result = OriginalS2CellId::FromFace(face);
+        uint64_t path = (new_id >> kLevelBits) & ((1ULL << kPathBits) - 1);
+        
+        for (int i = 0; i < level; ++i) {
+            int child_pos = static_cast<int>((path >> (2 * (level - 1 - i))) & 3);
+            if (child_pos < 0 || child_pos >= 4) {
+                return OriginalS2CellId::None(); // 无效子节点位置
+            }
+            result = result.child(child_pos);
+            if (!result.is_valid()) {
+                return OriginalS2CellId::None(); // 子节点操作失败
+            }
+        }
+        
+        return result;
+    }
+};
 
 // Hasher for S2CellId.
 // Does *not* need to be specified explicitly; this will be used by default for
@@ -750,6 +1003,11 @@ struct S2CellIdHash {
   }
 };
 
+// 输出流操作符
+inline std::ostream& operator<<(std::ostream& os, const S2CellId& id) {
+    return os << id.ToString();
+}
+
 // Parse valid S2 tokens from a string. Returns false if the token cannot be
 // parsed with S2CellId::FromToken.
 bool AbslParseFlag(absl::string_view input, S2CellId* id, std::string* error);
@@ -757,6 +1015,5 @@ bool AbslParseFlag(absl::string_view input, S2CellId* id, std::string* error);
 // Unparse a valid S2 token into a string that can be parsed by AbslParseFlag.
 std::string AbslUnparseFlag(S2CellId id);
 
-#undef IFNDEF_SWIG
 
 #endif  // S2_S2CELL_ID_H_
