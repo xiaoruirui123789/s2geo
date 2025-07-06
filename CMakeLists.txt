@@ -537,7 +537,7 @@ if (BUILD_TESTS)
       src/s2/s2builderutil_testing_test.cc
       src/s2/s2cap_test.cc
       src/s2/s2cell_id_test.cc
-      s2cell_id_v2_comprehensive_test.cc
+      s2cell_id_v2_test.cc
       src/s2/s2cell_index_test.cc
       src/s2/s2cell_iterator_join_test.cc
       src/s2/s2cell_iterator_testing_test.cc

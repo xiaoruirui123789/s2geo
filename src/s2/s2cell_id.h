@@ -19,6 +19,7 @@
 #include <vector>
 #include <exception>
 #include <algorithm>     // 为std::min/max
+#include <cassert>       // 为断言
 
 // 前向声明，避免命名冲突
 using OriginalS2CellId = s2v1::S2CellId;
@@ -52,7 +53,11 @@ public:
     
     // 从原OriginalS2CellId构造
     explicit S2CellId(const OriginalS2CellId& old_id) {
-        new_id_ = ConvertFromOldFormat(old_id);
+        if (old_id.level() > kMaxLevel) {
+            new_id_ = ConvertFromOldFormat(old_id.parent(kMaxLevel));
+        } else {
+            new_id_ = ConvertFromOldFormat(old_id);
+        }
     }
     
     // 从S2Point构造
@@ -75,6 +80,9 @@ public:
     
     // 从OriginalS2CellId构造（推荐使用的方法名）
     static S2CellId FromS2CellId(const OriginalS2CellId& old_id) {
+        if (old_id.level() > kMaxLevel) {
+            return S2CellId(old_id.parent(kMaxLevel));
+        }
         return S2CellId(old_id);
     }
     
@@ -85,6 +93,7 @@ public:
     
     // 从face和level构造
     static S2CellId FromFaceLevel(int face, int level) {
+        // 参数检查：如果参数不在有效范围内，返回无效ID
         if (face < 0 || face > 5 || level < 0 || level > kMaxLevel) {
             return S2CellId(); // 返回无效ID
         }
@@ -106,6 +115,10 @@ public:
             if (!old_id.is_valid()) {
                 return S2CellId(); // 返回无效ID
             }
+            
+            // 断言检查：old_id的层级应该等于请求的层级
+            assert(old_id.level() == level && "FromFacePosLevel produced unexpected level");
+            
             return S2CellId(old_id);
         }
     }
@@ -142,7 +155,12 @@ public:
     }
     
     static S2CellId FromFacePosLevel(int face, uint64_t pos, int level) {
-        if (level > kMaxLevel) return S2CellId(); // 超出支持范围
+        if (level > kMaxLevel) {
+            // 截断到最大支持层级
+            OriginalS2CellId old_id = OriginalS2CellId::FromFacePosLevel(face, pos, level);
+            if (!old_id.is_valid()) return S2CellId();
+            return S2CellId(old_id.parent(kMaxLevel));
+        }
         
         OriginalS2CellId old_id = OriginalS2CellId::FromFacePosLevel(face, pos, level);
         return S2CellId(old_id);
@@ -150,8 +168,10 @@ public:
     
     static S2CellId FromFaceIJ(int face, int i, int j) {
         OriginalS2CellId old_id = OriginalS2CellId::FromFaceIJ(face, i, j);
+        if (!old_id.is_valid()) return S2CellId();
+        
         if (old_id.level() > kMaxLevel) {
-            // 如果层级太高，选择合适的祖先
+            // 截断到最大支持层级
             old_id = old_id.parent(kMaxLevel);
         }
         return S2CellId(old_id);
@@ -168,14 +188,20 @@ public:
     }
     
     static S2CellId Begin(int level) {
-        if (level > kMaxLevel) return S2CellId();
+        if (level > kMaxLevel) {
+            // 截断到最大支持层级
+            level = kMaxLevel;
+        }
         
         OriginalS2CellId old_id = OriginalS2CellId::Begin(level);
         return S2CellId(old_id);
     }
     
     static S2CellId End(int level) {
-        if (level > kMaxLevel) return S2CellId();
+        if (level > kMaxLevel) {
+            // 截断到最大支持层级
+            level = kMaxLevel;
+        }
         
         OriginalS2CellId old_id = OriginalS2CellId::End(level);
         return S2CellId(old_id);
@@ -190,12 +216,18 @@ public:
     
     // 转换为原OriginalS2CellId格式
     OriginalS2CellId ToOldFormat() const {
-        return ConvertToOldFormat(new_id_);
+        OriginalS2CellId result = ConvertToOldFormat(new_id_);
+        // 断言检查：ToOldFormat()的结果不应该超过28层
+        assert(!result.is_valid() || result.level() <= kMaxLevel && "ToOldFormat produced level > kMaxLevel");
+        return result;
     }
     
     // 转换为OriginalS2CellId（推荐使用的方法名）
     OriginalS2CellId ToS2CellId() const {
-        return ConvertToOldFormat(new_id_);
+        OriginalS2CellId result = ConvertToOldFormat(new_id_);
+        // 断言检查：ToS2CellId()的结果不应该超过28层
+        assert(!result.is_valid() || result.level() <= kMaxLevel && "ToS2CellId produced level > kMaxLevel");
+        return result;
     }
     
     // ==================== 位置和几何属性（委托实现） ====================
@@ -324,6 +356,7 @@ public:
     
     // 获取指定层级的父节点
     S2CellId parent(int target_level) const {
+        // 参数检查：目标层级应该在有效范围内
         if (target_level < 0 || target_level > kMaxLevel) return S2CellId();
         if (target_level >= level()) return *this;
         
@@ -331,6 +364,10 @@ public:
         if (level() - target_level > 5) {
             OriginalS2CellId old_format = ToOldFormat();
             OriginalS2CellId parent_old = old_format.parent(target_level);
+            
+            // 断言检查：parent()操作的结果不应该超过28层
+            assert(!parent_old.is_valid() || parent_old.level() <= kMaxLevel && "parent() produced level > kMaxLevel");
+            
             return S2CellId(parent_old);
         }
         
@@ -343,6 +380,7 @@ public:
     }
     
     S2CellId child(int position) const {
+        // 参数检查：子节点位置应该在有效范围内
         if (!is_valid()) return S2CellId();
         if (position < 0 || position >= 4) return S2CellId(); // 无效位置
         
@@ -355,7 +393,12 @@ public:
                            (child_path << kLevelBits) |
                            static_cast<uint64_t>(child_level);
         
-        return S2CellId(child_id);
+        S2CellId result(child_id);
+        
+        // 断言检查：子节点的层级不应该超过28层
+        assert(result.level() <= kMaxLevel && "child() produced level > kMaxLevel");
+        
+        return result;
     }
     
     // ==================== 坐标转换（委托实现） ====================
@@ -401,9 +444,9 @@ public:
         OriginalS2CellId range_min_old = old_format.range_min();
         if (!range_min_old.is_valid()) return S2CellId(); // Invalid range_min
         
-        // Check if the range_min level exceeds our limit
+        // 如果结果层级超过kMaxLevel，则截断到kMaxLevel
         if (range_min_old.level() > kMaxLevel) {
-            range_min_old = range_min_old.parent(kMaxLevel);
+            return S2CellId(range_min_old.parent(kMaxLevel));
         }
         
         return S2CellId(range_min_old);
@@ -418,9 +461,9 @@ public:
         OriginalS2CellId range_max_old = old_format.range_max();
         if (!range_max_old.is_valid()) return S2CellId(); // Invalid range_max
         
-        // Check if the range_max level exceeds our limit
+        // 如果结果层级超过kMaxLevel，则截断到kMaxLevel
         if (range_max_old.level() > kMaxLevel) {
-            range_max_old = range_max_old.parent(kMaxLevel);
+            return S2CellId(range_max_old.parent(kMaxLevel));
         }
         
         return S2CellId(range_max_old);
@@ -431,9 +474,13 @@ public:
         OriginalS2CellId limit_old = limit.ToOldFormat();
         OriginalS2CellId result_old = old_format.maximum_tile(limit_old);
         
+        if (!result_old.is_valid()) return S2CellId();
+        
+        // 如果结果层级超过kMaxLevel，则截断到kMaxLevel
         if (result_old.level() > kMaxLevel) {
-            return S2CellId();
+            return S2CellId(result_old.parent(kMaxLevel));
         }
+        
         return S2CellId(result_old);
     }
     
@@ -445,10 +492,21 @@ public:
     }
     
     S2CellId child_begin(int target_level) const {
-        if (target_level > kMaxLevel || target_level <= level()) return S2CellId();
+        if (target_level <= level()) return S2CellId();
+        
+        if (target_level > kMaxLevel) {
+            // 截断到最大支持层级
+            target_level = kMaxLevel;
+        }
         
         OriginalS2CellId old_format = ToOldFormat();
         OriginalS2CellId child_old = old_format.child_begin(target_level);
+        
+        if (!child_old.is_valid()) return S2CellId();
+        
+        // 断言检查：child_begin结果不应该超过28层
+        assert(child_old.level() <= kMaxLevel && "child_begin produced level > kMaxLevel");
+        
         return S2CellId(child_old);
     }
     
@@ -459,18 +517,30 @@ public:
         OriginalS2CellId old_format = ToOldFormat();
         OriginalS2CellId child_end_old = old_format.child_end();
         
-        if (child_end_old.level() > kMaxLevel) {
-            return S2CellId();
-        }
+        if (!child_end_old.is_valid()) return S2CellId();
+        
+        // 断言检查：child_end结果不应该超过28层
+        assert(child_end_old.level() <= kMaxLevel && "child_end produced level > kMaxLevel");
         
         return S2CellId(child_end_old);
     }
     
     S2CellId child_end(int target_level) const {
-        if (target_level > kMaxLevel || target_level <= level()) return S2CellId();
+        if (target_level <= level()) return S2CellId();
+        
+        if (target_level > kMaxLevel) {
+            // 截断到最大支持层级
+            target_level = kMaxLevel;
+        }
         
         OriginalS2CellId old_format = ToOldFormat();
         OriginalS2CellId child_old = old_format.child_end(target_level);
+        
+        if (!child_old.is_valid()) return S2CellId();
+        
+        // 断言检查：child_end结果不应该超过28层
+        assert(child_old.level() <= kMaxLevel && "child_end produced level > kMaxLevel");
+        
         return S2CellId(child_old);
     }
     
@@ -480,10 +550,10 @@ public:
         OriginalS2CellId old_format = ToOldFormat();
         OriginalS2CellId next_old = old_format.next();
         
-        // 检查结果是否在支持范围内
-        if (next_old.level() > kMaxLevel) {
-            return S2CellId(); // 超出支持范围
-        }
+        if (!next_old.is_valid()) return S2CellId();
+        
+        // 断言检查：next()操作的结果不应该超过28层
+        assert(next_old.level() <= kMaxLevel && "next() produced level > kMaxLevel");
         
         return S2CellId(next_old);
     }
@@ -492,9 +562,10 @@ public:
         OriginalS2CellId old_format = ToOldFormat();
         OriginalS2CellId prev_old = old_format.prev();
         
-        if (prev_old.level() > kMaxLevel) {
-            return S2CellId();
-        }
+        if (!prev_old.is_valid()) return S2CellId();
+        
+        // 断言检查：prev()操作的结果不应该超过28层
+        assert(prev_old.level() <= kMaxLevel && "prev() produced level > kMaxLevel");
         
         return S2CellId(prev_old);
     }
@@ -503,9 +574,10 @@ public:
         OriginalS2CellId old_format = ToOldFormat();
         OriginalS2CellId next_old = old_format.next_wrap();
         
-        if (next_old.level() > kMaxLevel) {
-            return S2CellId();
-        }
+        if (!next_old.is_valid()) return S2CellId();
+        
+        // 断言检查：next_wrap()操作的结果不应该超过28层
+        assert(next_old.level() <= kMaxLevel && "next_wrap() produced level > kMaxLevel");
         
         return S2CellId(next_old);
     }
@@ -514,9 +586,10 @@ public:
         OriginalS2CellId old_format = ToOldFormat();
         OriginalS2CellId prev_old = old_format.prev_wrap();
         
-        if (prev_old.level() > kMaxLevel) {
-            return S2CellId();
-        }
+        if (!prev_old.is_valid()) return S2CellId();
+        
+        // 断言检查：prev_wrap()操作的结果不应该超过28层
+        assert(prev_old.level() <= kMaxLevel && "prev_wrap() produced level > kMaxLevel");
         
         return S2CellId(prev_old);
     }
@@ -525,9 +598,10 @@ public:
         OriginalS2CellId old_format = ToOldFormat();
         OriginalS2CellId result_old = old_format.advance(steps);
         
-        if (result_old.level() > kMaxLevel) {
-            return S2CellId();
-        }
+        if (!result_old.is_valid()) return S2CellId();
+        
+        // 断言检查：advance()操作的结果不应该超过28层
+        assert(result_old.level() <= kMaxLevel && "advance() produced level > kMaxLevel");
         
         return S2CellId(result_old);
     }
@@ -536,9 +610,10 @@ public:
         OriginalS2CellId old_format = ToOldFormat();
         OriginalS2CellId result_old = old_format.advance_wrap(steps);
         
-        if (result_old.level() > kMaxLevel) {
-            return S2CellId();
-        }
+        if (!result_old.is_valid()) return S2CellId();
+        
+        // 断言检查：advance_wrap()操作的结果不应该超过28层
+        assert(result_old.level() <= kMaxLevel && "advance_wrap() produced level > kMaxLevel");
         
         return S2CellId(result_old);
     }
@@ -564,11 +639,10 @@ public:
         ToOldFormat().GetEdgeNeighbors(old_neighbors);
         
         for (int i = 0; i < 4; ++i) {
-            if (old_neighbors[i].is_valid() && old_neighbors[i].level() <= kMaxLevel) {
+            if (old_neighbors[i].is_valid()) {
+                // 断言检查：邻居不应该超过28层（因为当前cell已经不超过28层）
+                assert(old_neighbors[i].level() <= kMaxLevel && "GetEdgeNeighbors produced level > kMaxLevel");
                 neighbors[i] = S2CellId(old_neighbors[i]);
-            } else if (old_neighbors[i].is_valid()) {
-                // 如果邻居层级太高，选择合适的祖先
-                neighbors[i] = S2CellId(old_neighbors[i].parent(kMaxLevel));
             } else {
                 neighbors[i] = S2CellId(); // 无效邻居
             }
@@ -577,14 +651,21 @@ public:
     
     void AppendVertexNeighbors(int nbr_level, std::vector<S2CellId>* output) const {
         if (!output) return; // 空指针检查
-        if (nbr_level > kMaxLevel || nbr_level < 0) return; // 超出支持范围
+        if (nbr_level < 0) return; // 无效层级
+        
+        if (nbr_level > kMaxLevel) {
+            // 截断到最大支持层级
+            nbr_level = kMaxLevel;
+        }
         
         std::vector<OriginalS2CellId> old_neighbors;
         ToOldFormat().AppendVertexNeighbors(nbr_level, &old_neighbors);
         
         output->reserve(output->size() + old_neighbors.size());
         for (const auto& neighbor : old_neighbors) {
-            if (neighbor.is_valid() && neighbor.level() <= kMaxLevel) {
+            if (neighbor.is_valid()) {
+                // 断言检查：邻居层级应该是nbr_level（已经被截断到<=kMaxLevel）
+                assert(neighbor.level() <= kMaxLevel && "AppendVertexNeighbors produced level > kMaxLevel");
                 output->push_back(S2CellId(neighbor));
             }
         }
@@ -592,14 +673,21 @@ public:
     
     void AppendAllNeighbors(int nbr_level, std::vector<S2CellId>* output) const {
         if (!output) return; // 空指针检查
-        if (nbr_level > kMaxLevel || nbr_level < 0) return;
+        if (nbr_level < 0) return;
+        
+        if (nbr_level > kMaxLevel) {
+            // 截断到最大支持层级
+            nbr_level = kMaxLevel;
+        }
         
         std::vector<OriginalS2CellId> old_neighbors;
         ToOldFormat().AppendAllNeighbors(nbr_level, &old_neighbors);
         
         output->reserve(output->size() + old_neighbors.size());
         for (const auto& neighbor : old_neighbors) {
-            if (neighbor.is_valid() && neighbor.level() <= kMaxLevel) {
+            if (neighbor.is_valid()) {
+                // 断言检查：邻居层级应该是nbr_level（已经被截断到<=kMaxLevel）
+                assert(neighbor.level() <= kMaxLevel && "AppendAllNeighbors produced level > kMaxLevel");
                 output->push_back(S2CellId(neighbor));
             }
         }
@@ -802,6 +890,7 @@ public:
         OriginalS2CellId old_id;
         if (old_id.Decode(decoder)) {
             if (old_id.level() > kMaxLevel) {
+                // 截断到最大支持层级
                 old_id = old_id.parent(kMaxLevel);
             }
             new_id_ = ConvertFromOldFormat(old_id);
@@ -840,6 +929,7 @@ public:
         if (!old_id.is_valid()) return S2CellId();
         
         if (old_id.level() > kMaxLevel) {
+            // 截断到最大支持层级
             old_id = old_id.parent(kMaxLevel);
         }
         return S2CellId(old_id);
@@ -860,6 +950,7 @@ public:
             OriginalS2CellId::Coder old_coder;
             if (old_coder.Decode(decoder, old_value, error)) {
                 if (old_value.level() > kMaxLevel) {
+                    // 截断到最大支持层级
                     old_value = old_value.parent(kMaxLevel);
                 }
                 v = S2CellId(old_value);
@@ -879,8 +970,14 @@ private:
         int face = old_id.face();
         int level = old_id.level();
         
-        // 检查是否超出支持范围
-        if (level > kMaxLevel) return 0;
+        // 断言检查：输入的层级应该不超过支持的最大层级
+        assert(level <= kMaxLevel && "ConvertFromOldFormat: input level > kMaxLevel");
+        
+        // 如果层级超出支持范围，自动截断
+        if (level > kMaxLevel) {
+            // 这种情况下应该在调用前已经处理，但这里添加保护
+            return ConvertFromOldFormat(old_id.parent(kMaxLevel));
+        }
         
         // 验证face范围
         if (face < 0 || face >= 6) return 0;
@@ -958,7 +1055,10 @@ private:
         
         // 如果是根节点，直接返回
         if (level == 0) {
-            return OriginalS2CellId::FromFace(face);
+            OriginalS2CellId result = OriginalS2CellId::FromFace(face);
+            // 断言检查：FromFace应该产生有效的根节点
+            assert(result.is_valid() && result.level() == 0 && "FromFace should produce valid root cell");
+            return result;
         }
         
         // 从路径重建S2CellId
@@ -975,6 +1075,11 @@ private:
                 return OriginalS2CellId::None(); // 子节点操作失败
             }
         }
+        
+        // 断言检查：最终结果的层级应该匹配
+        assert(result.level() == level && "ConvertToOldFormat: result level mismatch");
+        // 断言检查：最终结果不应该超过支持的最大层级
+        assert(result.level() <= kMaxLevel && "ConvertToOldFormat: result level > kMaxLevel");
         
         return result;
     }
