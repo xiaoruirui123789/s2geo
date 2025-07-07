@@ -93,9 +93,14 @@ public:
     
     // 从face和level构造
     static S2CellId FromFaceLevel(int face, int level) {
-        // 参数检查：如果参数不在有效范围内，返回无效ID
-        if (face < 0 || face > 5 || level < 0 || level > kMaxLevel) {
+        // 参数检查：如果face不在有效范围内，返回无效ID
+        if (face < 0 || face > 5 || level < 0) {
             return S2CellId(); // 返回无效ID
+        }
+        
+        // 级别截断：如果level超过支持范围，截断到最大支持层级
+        if (level > kMaxLevel) {
+            level = kMaxLevel;
         }
         
         if (level == 0) {

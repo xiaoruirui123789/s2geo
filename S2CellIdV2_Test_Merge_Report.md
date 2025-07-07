@@ -1,7 +1,7 @@
 # S2CellId V2 测试合并报告
 
 ## 概述
-成功将 `s2cell_id_v2_comprehensive_test.cc` 和 `s2cell_id_v2_essential_test.cc` 合并为一个综合测试文件 `s2cell_id_v2_test.cc`。
+成功将 `s2cell_id_v2_comprehensive_test.cc` 和 `s2cell_id_v2_essential_test.cc` 合并为一个综合测试文件 `s2cell_id_v2_test.cc`。同时改进了 `FromFaceLevel` 方法的级别截断行为。
 
 ## 文件更改
 
@@ -14,65 +14,36 @@
 
 ### 修改文件
 - `CMakeLists.txt` - 更新了构建配置
-
-## 测试覆盖范围
-
-新的合并测试文件包含了以下32个测试案例：
-
-### 构造测试
-- `DefaultConstructor` - 默认构造函数测试
-- `NoneConstructor` - None构造函数测试
-- `FromFace` - 从面构造测试
-- `FromFaceLevel` - 从面和层级构造测试
-- `FromFacePosLevel` - 从面、位置和层级构造测试
-- `FromFaceIJ` - 从面和IJ坐标构造测试
-- `FromPoint` - 从点构造测试
-- `FromLatLng` - 从经纬度构造测试
-
-### 令牌和字符串测试
-- `BeginEnd` - 开始/结束测试
-- `TokenRoundTrip` - 令牌往返测试
-- `FaceTokens` - 面令牌测试
-- `ToStringFromString` - 字符串转换测试
-- `ToDebugString` - 调试字符串测试
-
-### 兼容性测试
-- `OriginalS2CellIdCompatibility` - 原始S2CellId兼容性测试
-- `BiDirectionalConversion` - 双向转换测试
-
-### 导航测试
-- `ParentChild` - 父子关系测试
-- `NavigationOperations` - 导航操作测试
-- `RangeOperations` - 范围操作测试
-- `ChildIterators` - 子迭代器测试
-- `AdvanceOperations` - 前进操作测试
-- `DistanceFromBegin` - 起始距离测试
-
-### 几何测试
-- `GeometricProperties` - 几何属性测试
-- `ContainsIntersects` - 包含/相交测试
-- `CommonAncestor` - 公共祖先测试
-
-### 邻居测试
-- `EdgeNeighbors` - 边邻居测试
-
-### 实用功能测试
-- `ChildPosition` - 子位置测试
-- `IsLeafIsFace` - 叶子/面检测测试
-- `EdgeCases` - 边界情况测试
-- `InvalidInputHandling` - 无效输入处理测试
-
-### 性能和容器测试
-- `PerformanceBasicOperations` - 基本操作性能测试
-- `HashAndContainers` - 哈希和容器测试
-- `StressTestDeepHierarchy` - 深层次压力测试
+- `src/s2/s2cell_id.h` - 改进了 `FromFaceLevel` 方法的级别截断行为
 
 ## 关键改进
 
-1. **测试整合** - 合并了两个测试文件的最佳部分，避免重复和冲突
-2. **稳定性提升** - 修复了一些不稳定的测试（如BeginEnd和CommonAncestor）
-3. **性能优化** - 限制了测试的层级深度以提高运行速度
-4. **错误处理** - 改进了对边界情况的处理
+### 1. `FromFaceLevel` 方法改进
+
+**之前的行为：**
+```cpp
+if (face < 0 || face > 5 || level < 0 || level > kMaxLevel) {
+    return S2CellId(); // 返回无效ID
+}
+```
+
+**改进后的行为：**
+```cpp
+// 参数检查：如果face不在有效范围内，返回无效ID
+if (face < 0 || face > 5 || level < 0) {
+    return S2CellId(); // 返回无效ID
+}
+
+// 级别截断：如果level超过支持范围，截断到最大支持层级
+if (level > kMaxLevel) {
+    level = kMaxLevel;
+}
+```
+
+**改进的好处：**
+- **一致性**：与其他方法（如 `FromFacePosLevel`, `FromToken`, `Begin`, `End`）保持一致的截断行为
+- **鲁棒性**：不会因为略微超出范围的输入就返回无效结果
+- **可预测性**：用户可以预期超出范围的级别会被安全截断而不是失败
 
 ## 测试结果
 

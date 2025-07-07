@@ -637,8 +637,15 @@ TEST_F(S2CellIdV2Test, InvalidInputHandling) {
     S2CellId invalid_level = S2CellId::FromFaceLevel(0, -1);
     EXPECT_FALSE(invalid_level.is_valid());
     
-    invalid_level = S2CellId::FromFaceLevel(0, S2CellId::kMaxLevel + 1);
-    EXPECT_FALSE(invalid_level.is_valid());
+    // Test level truncation - should now be valid and truncated to kMaxLevel
+    S2CellId truncated_level = S2CellId::FromFaceLevel(0, S2CellId::kMaxLevel + 1);
+    EXPECT_TRUE(truncated_level.is_valid());
+    EXPECT_EQ(truncated_level.level(), S2CellId::kMaxLevel);
+    
+    // Test a very high level - should be truncated
+    S2CellId very_high_level = S2CellId::FromFaceLevel(0, S2CellId::kMaxLevel + 10);
+    EXPECT_TRUE(very_high_level.is_valid());
+    EXPECT_EQ(very_high_level.level(), S2CellId::kMaxLevel);
     
     // Test invalid child position
     S2CellId valid_cell = S2CellId::FromFaceLevel(0, 1);
